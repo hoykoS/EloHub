@@ -2,8 +2,9 @@
 	EloHub — мобильная панель способностей
 	LocalScript → StarterPlayer → StarterPlayerScripts
 
-	ESP (бокс/обводка + хп) · Скорость · Полёт · Жёсткое наведение · Телепорт к игроку
-	Размер панели настраивается ползунком внизу.
+	Всё работает на клиенте, серверная часть не нужна.
+
+	Вкладки: Обзор · Движение · Бой · UI
 ]]
 
 local Players          = game:GetService("Players")
@@ -12,34 +13,8 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService     = game:GetService("TweenService")
 local Workspace        = game:GetService("Workspace")
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-
 local player  = Players.LocalPlayer
 local camera  = Workspace.CurrentCamera
-
---==============================================================
--- ДОСТУП И УДАЛЁННЫЙ КОНФИГ
---==============================================================
--- Решение принимает сервер: клиент не может выдать себе доступ,
--- подменив значение, потому что панель дальше просто не строится.
-local accessRemote = ReplicatedStorage:WaitForChild("EloAccess", 30)
-if not accessRemote then
-	warn("[EloHub] серверная часть не найдена")
-	return
-end
-
-local function requestAccess()
-	local ok, result = pcall(function()
-		return accessRemote:InvokeServer()
-	end)
-	if ok and type(result) == "table" then return result end
-	return nil
-end
-
-local access = requestAccess()
-if not access or not access.allowed then return end
-
-local remoteSettings = access.settings or {}
 
 --==============================================================
 -- ПАЛИТРА
@@ -89,25 +64,6 @@ local state = {
 
 local DEFAULT_WALKSPEED = 16
 
--- значения из конфига перекрывают локальные умолчания
-local function applyRemoteSettings(settings)
-	if type(settings) ~= "table" then return end
-
-	local numbers = {
-		"speedValue", "flySpeed", "wallAlpha",
-		"aimFov", "triggerRadius", "triggerDelay", "uiScale",
-	}
-	for _, key in ipairs(numbers) do
-		if type(settings[key]) == "number" then state[key] = settings[key] end
-	end
-
-	if type(settings.aimPart) == "string" then state.aimPart = settings.aimPart end
-	if type(settings.aimWall) == "boolean" then state.aimWall = settings.aimWall end
-	if type(settings.aimNpc) == "boolean" then state.aimNpc = settings.aimNpc end
-end
-
-applyRemoteSettings(remoteSettings)
-
 --[[ Подключение к боевой системе твоей игры.
      Триггербот и silent aim не могут «стрелять» сами — они лишь сообщают,
      куда целиться. Пропиши сюда свой RemoteEvent, и оба начнут работать. ]]
@@ -116,13 +72,6 @@ local CONFIG = {
 	triggerRadius = 45,    -- цель должна быть в этом радиусе от центра, px
 	triggerDelay  = 0.12,  -- пауза между авто-срабатываниями, сек
 }
-
-if type(remoteSettings.triggerRadius) == "number" then
-	CONFIG.triggerRadius = remoteSettings.triggerRadius
-end
-if type(remoteSettings.triggerDelay) == "number" then
-	CONFIG.triggerDelay = remoteSettings.triggerDelay
-end
 
 --==============================================================
 -- ХЕЛПЕРЫ
@@ -1706,52 +1655,6 @@ new("TextLabel", {
 makeSlider(sizeCard, 36, "Масштаб: %d%%", 70, 160, state.uiScale, function(value)
 	state.uiScale = value
 	uiScale.Scale = value / 100
-end)
-
---==============================================================
--- ВИДИМОСТЬ СТРОК ПО КОНФИГУ + ОТЗЫВ ДОСТУПА
---==============================================================
-local cards = {
-	esp        = espCard,
-	arrows     = arrowCard,
-	noclip     = noclipCard,
-	wall       = wallCard,
-	speed      = speedCard,
-	fly        = flyCard,
-	aim        = aimCard,
-	silent     = silentCard,
-	trigger    = triggerCard,
-	tp         = tpCard,
-	tapTp      = tapCard,
-	uiScaleRow = sizeCard,
-}
-
-local function applyFeatureFlags(settings)
-	local flags = settings and settings.features
-	if type(flags) ~= "table" then return end
-	for key, card in pairs(cards) do
-		-- UIListLayout сам пропускает скрытые элементы, дырки не остаётся
-		card.Visible = flags[key] ~= false
-	end
-end
-
-applyFeatureFlags(remoteSettings)
-
--- конфиг перечитывается на ходу: правишь JSON — панель подхватывает,
--- перезаходить в игру не нужно
-task.spawn(function()
-	while true do
-		task.wait(60)
-		local fresh = requestAccess()
-		if fresh then
-			if not fresh.allowed then
-				gui:Destroy()
-				break
-			end
-			applyRemoteSettings(fresh.settings)
-			applyFeatureFlags(fresh.settings)
-		end
-	end
 end)
 
 --==============================================================

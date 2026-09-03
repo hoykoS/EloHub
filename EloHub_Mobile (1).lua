@@ -42,18 +42,33 @@ local state = {
 	speedValue = 32,
 	flySpeed   = 60,
 
-	wall       = false,
-	wallAlpha  = 0.75,    -- насколько прозрачной становится геометрия
+	noclip     = false,   -- проход сквозь стены
+	wall       = false,   -- полупрозрачная геометрия
+	wallAlpha  = 0.75,
 
 	aimFov     = 150,     -- радиус поля захвата в пикселях
 	aimPart    = "Head",
 	aimWall    = true,
 	aimNpc     = true,
 
+	silent     = false,   -- направление стрельбы в цель без поворота камеры
+	trigger    = false,   -- авто-срабатывание при захвате
+	arrows     = false,   -- стрелки к целям вне экрана
+	tapTp      = false,   -- телепорт по тапу в точку
+
 	tpTarget   = nil,     -- выбранный игрок
 }
 
 local DEFAULT_WALKSPEED = 16
+
+--[[ Подключение к боевой системе твоей игры.
+     Триггербот и silent aim не могут «стрелять» сами — они лишь сообщают,
+     куда целиться. Пропиши сюда свой RemoteEvent, и оба начнут работать. ]]
+local CONFIG = {
+	fireRemote    = nil,   -- пример: game.ReplicatedStorage:WaitForChild("Fire")
+	triggerRadius = 45,    -- цель должна быть в этом радиусе от центра, px
+	triggerDelay  = 0.12,  -- пауза между авто-срабатываниями, сек
+}
 
 --==============================================================
 -- ХЕЛПЕРЫ
@@ -216,18 +231,22 @@ local launcher = new("TextButton", {
 new("UICorner", { CornerRadius = UDim.new(1, 0), Parent = launcher })
 stroke(2, PALETTE.white, 0.15, launcher)
 
-local panel = new("Frame", {
+-- CanvasGroup: даёт GroupTransparency, поэтому панель гаснет целиком одним твином
+local panel = new("CanvasGroup", {
 	Name = "Panel",
 	Position = UDim2.new(0, 16, 0, 90),
 	Size = UDim2.new(0.86, 0, 0, 448),
 	BackgroundTransparency = 1,
+	GroupTransparency = 1,
+	Visible = false,
 	Active = true,
 	ZIndex = 10,
 	Parent = gui,
 })
 new("UISizeConstraint", { MaxSize = Vector2.new(336, 448), MinSize = Vector2.new(252, 380), Parent = panel })
 
-local uiScale = new("UIScale", { Scale = 1, Parent = panel })
+local uiScale = new("UIScale", { Scale = 0.7, Parent = panel })
+local panelHome = panel.Position   -- куда панель возвращается после анимации
 
 buildBackdrop(panel)
 
@@ -485,6 +504,7 @@ local function clearEspFor(model)
 	if not data then return end
 	if data.box then data.box:Destroy() end
 	if data.highlight then data.highlight:Destroy() end
+	if data.arrow then data.arrow:Destroy() end
 	espTracked[model] = nil
 end
 
@@ -559,9 +579,36 @@ local function buildBox(color)
 	return box, name, hpFill, hpText
 end
 
+local function buildArrow(color)
+	local arrow = new("TextLabel", {
+		Name = "EloArrow",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Size = UDim2.fromOffset(34, 34),
+		BackgroundTransparency = 1,
+		Text = "\u{25B2}",
+		TextColor3 = color,
+		Font = Enum.Font.GothamBold,
+		TextSize = 26,
+		Visible = false,
+		ZIndex = 4,
+		Parent = espLayer,
+	})
+	new("UIStroke", { Thickness = 2, Color = Color3.new(0, 0, 0), Transparency = 0.4, Parent = arrow })
+	return arrow
+end
+
 local function addEsp(model, labelText, color)
 	if espTracked[model] then return end
 	local data = { name = labelText, color = color }
+
+	if state.arrows then
+		data.arrow = buildArrow(color)
+	end
+
+	if not state.esp then
+		espTracked[model] = data
+		return
+	end
 
 	if state.espMode == "box" then
 		data.box, data.nameLabel, data.hpFill, data.hpText = buildBox(color)
@@ -603,7 +650,7 @@ local function addEsp(model, labelText, color)
 end
 
 local function scanEsp()
-	if not state.esp then return end
+	if not (state.esp or state.arrows) then return end
 	local seen = {}
 
 	for _, other in ipairs(Players:GetPlayers()) do
@@ -631,7 +678,7 @@ end
 task.spawn(function()
 	while true do
 		task.wait(1)
-		if state.esp then pcall(scanEsp) end
+		if state.esp or state.arrows then pcall(scanEsp) end
 	end
 end)
 
@@ -690,6 +737,47 @@ RunService.RenderStepped:Connect(function()
 				end
 			else
 				box.Visible = false
+			end
+		end
+	end
+end)
+
+-- стрелки к целям, которых не видно в кадре
+RunService.RenderStepped:Connect(function()
+	if not state.arrows then return end
+
+	local vp = camera.ViewportSize
+	local center = Vector2.new(vp.X / 2, vp.Y / 2)
+	local radius = math.min(vp.X, vp.Y) / 2 - 56
+
+	for model, data in pairs(espTracked) do
+		local arrow = data.arrow
+		if arrow then
+			local part = model:FindFirstChild("HumanoidRootPart")
+			local hum = model:FindFirstChildOfClass("Humanoid")
+
+			if part and hum and hum.Health > 0 then
+				local sp = camera:WorldToViewportPoint(part.Position)
+				local onScreen = sp.Z > 0
+					and sp.X >= 0 and sp.X <= vp.X
+					and sp.Y >= 0 and sp.Y <= vp.Y
+
+				if onScreen then
+					arrow.Visible = false
+				else
+					local offset = Vector2.new(sp.X, sp.Y) - center
+					-- за спиной координаты зеркалятся, разворачиваем обратно
+					if sp.Z <= 0 then offset = -offset end
+					if offset.Magnitude < 1 then offset = Vector2.new(0, -1) end
+
+					local dir = offset.Unit
+					local point = center + dir * radius
+					arrow.Position = UDim2.fromOffset(point.X, point.Y)
+					arrow.Rotation = math.deg(math.atan2(dir.X, -dir.Y))
+					arrow.Visible = true
+				end
+			else
+				arrow.Visible = false
 			end
 		end
 	end
@@ -848,7 +936,7 @@ local aimCircle = new("Frame", {
 	Parent = gui,
 })
 new("UICorner", { CornerRadius = UDim.new(1, 0), Parent = aimCircle })
-stroke(2, PALETTE.white, 0.55, aimCircle)
+local aimStroke = stroke(2, PALETTE.white, 0.55, aimCircle)
 
 local aimDot = new("Frame", {
 	AnchorPoint = Vector2.new(0.5, 0.5),
@@ -919,17 +1007,38 @@ local function pickTarget()
 	return best
 end
 
--- цель держится, пока жива и не вышла далеко за поле захвата
+-- пока игрок ведёт камеру, фиксация отпускается: иначе увести взгляд невозможно
+local lastLookInput = 0
+
+UserInputService.InputChanged:Connect(function(input, processed)
+	if processed then return end   -- ввод по панели и джойстику не считается
+
+	local isLook =
+		input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch
+		or (input.UserInputType == Enum.UserInputType.Gamepad1
+			and input.KeyCode == Enum.KeyCode.Thumbstick2)
+
+	if isLook and input.Delta.Magnitude > 1 then
+		lastLookInput = os.clock()
+	end
+end)
+
+local function cameraIsBeingMoved()
+	return (os.clock() - lastLookInput) < 0.12
+end
+
+-- цель держится, пока жива, видна и не вышла за поле захвата
 task.spawn(function()
 	while true do
-		task.wait(0.08)
-		if not state.aim then
+		task.wait(0.06)
+		if not (state.aim or state.silent or state.trigger) then
 			aimTarget = nil
 		else
 			local keep = false
 			if aimTarget and aimTarget.Parent and isAlive(aimTarget.Parent) then
 				local off = screenOffset(aimTarget)
-				keep = off ~= nil and off < state.aimFov * 1.6 and seesPart(aimTarget)
+				keep = off ~= nil and off < state.aimFov and seesPart(aimTarget)
 			end
 			if not keep then
 				local ok, result = pcall(pickTarget)
@@ -942,17 +1051,136 @@ end)
 -- после камерного скрипта, иначе доворот будет перебиваться
 RunService:BindToRenderStep("EloAimLock", Enum.RenderPriority.Camera.Value + 1, function()
 	if not state.aim then return end
-	if aimTarget and aimTarget.Parent and isAlive(aimTarget.Parent) then
+
+	local locked = aimTarget and aimTarget.Parent and isAlive(aimTarget.Parent)
+
+	-- жёсткая фиксация, но только пока камеру не ведут вручную
+	if locked and not cameraIsBeingMoved() then
 		camera.CFrame = CFrame.new(camera.CFrame.Position, aimTarget.Position)
-		aimDot.BackgroundColor3 = PALETTE.accent
-	else
-		aimTarget = nil
-		aimDot.BackgroundColor3 = PALETTE.white
+	end
+
+	if not locked then aimTarget = nil end
+	aimDot.BackgroundColor3 = locked and PALETTE.accent or PALETTE.white
+	aimStroke.Transparency = locked and 0.25 or 0.55
+end)
+
+--==============================================================
+-- SILENT AIM: направление в цель без поворота камеры
+--==============================================================
+--[[ Камеру не трогаем — вместо этого отдаём точку цели наружу.
+     В своём оружейном скрипте вместо направления камеры возьми:
+
+         local elo = _G.EloHub
+         local dir = (elo and elo.aimDirection(muzzle.Position)) or camera.CFrame.LookVector
+
+     Если silent aim выключен или цели нет, функция вернёт nil и сработает
+     твоя обычная логика. ]]
+local api = {}
+
+function api.target()
+	if not (state.silent or state.trigger) then return nil end
+	if aimTarget and aimTarget.Parent and isAlive(aimTarget.Parent) then
+		return aimTarget
+	end
+	return nil
+end
+
+function api.aimPosition()
+	local part = api.target()
+	return part and part.Position or nil
+end
+
+function api.aimDirection(origin)
+	local pos = api.aimPosition()
+	if not pos or not origin then return nil end
+	local delta = pos - origin
+	return delta.Magnitude > 0 and delta.Unit or nil
+end
+
+function api.isSilent() return state.silent end
+
+_G.EloHub = api
+
+--==============================================================
+-- ТРИГГЕРБОТ
+--==============================================================
+local lastFire = 0
+
+local function pullTrigger(part)
+	if CONFIG.fireRemote then
+		pcall(function()
+			CONFIG.fireRemote:FireServer(part.Parent, part.Position)
+		end)
+	end
+end
+
+task.spawn(function()
+	while true do
+		task.wait(0.03)
+		if state.trigger and aimTarget and aimTarget.Parent and isAlive(aimTarget.Parent) then
+			local off = screenOffset(aimTarget)
+			if off and off <= CONFIG.triggerRadius
+				and seesPart(aimTarget)
+				and (os.clock() - lastFire) >= CONFIG.triggerDelay then
+				lastFire = os.clock()
+				pullTrigger(aimTarget)
+			end
+		end
 	end
 end)
 
 --==============================================================
--- WALLHACK: геометрия становится полупрозрачной (только у тебя)
+-- ТЕЛЕПОРТ ПО ТАПУ В ТОЧКУ
+--==============================================================
+UserInputService.InputBegan:Connect(function(input, processed)
+	if not state.tapTp or processed then return end
+	if input.UserInputType ~= Enum.UserInputType.Touch
+		and input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+		return
+	end
+
+	local root = getRoot()
+	if not root then return end
+
+	local ray = camera:ViewportPointToRay(input.Position.X, input.Position.Y)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { player.Character }
+
+	local hit = Workspace:Raycast(ray.Origin, ray.Direction * 2000, params)
+	if hit then
+		root.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3.5, 0)) * (root.CFrame - root.CFrame.Position)
+	end
+end)
+
+--==============================================================
+-- WALLHACK: проход сквозь стены
+--==============================================================
+local collideMemory = {}
+
+-- Stepped идёт до расчёта физики — снимать коллизию нужно именно здесь
+RunService.Stepped:Connect(function()
+	if not state.noclip then return end
+	local char = player.Character
+	if not char then return end
+
+	for _, part in ipairs(char:GetDescendants()) do
+		if part:IsA("BasePart") and part.CanCollide then
+			if collideMemory[part] == nil then collideMemory[part] = true end
+			part.CanCollide = false
+		end
+	end
+end)
+
+local function restoreCollision()
+	for part, wasColliding in pairs(collideMemory) do
+		if part.Parent and wasColliding then part.CanCollide = true end
+	end
+	table.clear(collideMemory)
+end
+
+--==============================================================
+-- ПРОЗРАЧНЫЕ СТЕНЫ: геометрия просвечивает (только у тебя)
 --==============================================================
 local wallCache = {}
 local wallConn
@@ -1029,7 +1257,8 @@ end)
 local espCard = makeCard(1, 106)
 makeToggle(espCard, "ESP", "Игроки и NPC, хп в реальном времени", function(on)
 	state.esp = on
-	if on then scanEsp() else clearAllEsp() end
+	clearAllEsp()
+	scanEsp()
 end)
 
 local modeRow = new("Frame", {
@@ -1080,19 +1309,34 @@ for _, entry in ipairs({ { "box", "Бокс" }, { "outline", "Обводка" } 
 end
 selectEspMode("box")
 
--- 2. Wallhack + прозрачность
-local wallCard = makeCard(2, 110)
-makeToggle(wallCard, "Wallhack", "Стены становятся полупрозрачными", function(on)
+-- 2. Стрелки к целям вне экрана
+local arrowCard = makeCard(2, 58)
+makeToggle(arrowCard, "Стрелки к целям", "Указатели по краям экрана", function(on)
+	state.arrows = on
+	clearAllEsp()
+	scanEsp()
+end)
+
+-- 3. Wallhack
+local noclipCard = makeCard(3, 58)
+makeToggle(noclipCard, "Wallhack", "Проход сквозь стены и объекты", function(on)
+	state.noclip = on
+	if not on then restoreCollision() end
+end)
+
+-- 4. Прозрачные стены
+local wallCard = makeCard(4, 110)
+makeToggle(wallCard, "Прозрачные стены", "Геометрия просвечивает", function(on)
 	state.wall = on
 	if on then enableWall() else disableWall() end
 end)
-makeSlider(wallCard, 58, "Прозрачность стен: %d%%", 30, 95, 75, function(value)
+makeSlider(wallCard, 58, "Прозрачность: %d%%", 30, 95, 75, function(value)
 	state.wallAlpha = value / 100
 	if state.wall then refreshWallAlpha() end
 end)
 
--- 3. Скорость + ползунок
-local speedCard = makeCard(3, 110)
+-- 5. Скорость + ползунок
+local speedCard = makeCard(5, 110)
 makeToggle(speedCard, "Скорость", "Ускоренное передвижение", function(on)
 	state.speed = on
 	local hum = getHumanoid()
@@ -1106,8 +1350,8 @@ makeSlider(speedCard, 58, "Значение: %d", 16, 150, 32, function(value)
 	end
 end)
 
--- 4. Полёт
-local flyCard = makeCard(4, 58)
+-- 6. Полёт
+local flyCard = makeCard(6, 58)
 makeToggle(flyCard, "Полёт", "Джойстик — курс, ↑↓ — высота", function(on)
 	state.fly = on
 	if on then
@@ -1120,8 +1364,8 @@ makeToggle(flyCard, "Полёт", "Джойстик — курс, ↑↓ — в�
 	end
 end)
 
--- 5. Наведение + поле захвата
-local aimCard = makeCard(5, 110)
+-- 7. Наведение + поле захвата
+local aimCard = makeCard(7, 110)
 makeToggle(aimCard, "Наведение", "Жёсткая фиксация на цели", function(on)
 	state.aim = on
 	aimCircle.Visible = on
@@ -1132,8 +1376,22 @@ makeSlider(aimCard, 58, "Поле захвата: %d px", 40, 500, state.aimFov,
 	aimCircle.Size = UDim2.fromOffset(value * 2, value * 2)
 end)
 
--- 6. Телепорт к игроку
-local tpCard = makeCard(6, 126)
+-- 8. Silent aim
+local silentCard = makeCard(8, 58)
+makeToggle(silentCard, "Silent aim", "Стрельба в цель без поворота камеры", function(on)
+	state.silent = on
+	if not on then aimTarget = nil end
+end)
+
+-- 9. Триггербот
+local triggerCard = makeCard(9, 58)
+makeToggle(triggerCard, "Триггербот", "Авто-срабатывание при захвате цели", function(on)
+	state.trigger = on
+	if not on then aimTarget = nil end
+end)
+
+-- 10. Телепорт к игроку
+local tpCard = makeCard(10, 126)
 new("TextLabel", {
 	Position = UDim2.new(0, 0, 0, 10),
 	Size = UDim2.new(1, 0, 0, 20),
@@ -1307,8 +1565,14 @@ tpButton.Activated:Connect(function()
 	flashButton("Готово")
 end)
 
--- 7. Размер интерфейса
-local sizeCard = makeCard(7, 92)
+-- 11. Телепорт по тапу
+local tapCard = makeCard(11, 58)
+makeToggle(tapCard, "Телепорт по тапу", "Тап по миру — прыжок в точку", function(on)
+	state.tapTp = on
+end)
+
+-- 12. Размер интерфейса
+local sizeCard = makeCard(12, 92)
 new("TextLabel", {
 	Position = UDim2.new(0, 0, 0, 10),
 	Size = UDim2.new(1, 0, 0, 20),
@@ -1321,7 +1585,7 @@ new("TextLabel", {
 	ZIndex = 13,
 	Parent = sizeCard,
 })
-makeSlider(sizeCard, 36, "Масштаб: %d%%", 70, 160, 100, function(value)
+makeSlider(sizeCard, 36, "Масштаб: %d%%", 70, 160, 70, function(value)
 	uiScale.Scale = value / 100
 end)
 
@@ -1359,23 +1623,69 @@ end)
 UserInputService.InputEnded:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.Touch
 		or input.UserInputType == Enum.UserInputType.MouseButton1 then
+		if dragging then panelHome = panel.Position end
 		dragging = false
 		activeSlider = nil
 	end
 end)
 
 --==============================================================
--- СВОРАЧИВАНИЕ
+-- ПЛАВНОЕ ОТКРЫТИЕ И СКРЫТИЕ
 --==============================================================
-hideBtn.Activated:Connect(function()
-	panel.Visible = false
-	launcher.Visible = true
-end)
+local FADE = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local RISE = UDim2.fromOffset(0, 14)
 
-launcher.Activated:Connect(function()
+panelHome = panel.Position
+local launcherStroke = launcher:FindFirstChildOfClass("UIStroke")
+local panelOpen = false
+
+local function showLauncher(show)
+	if show then launcher.Visible = true end
+	TweenService:Create(launcher, FADE, {
+		BackgroundTransparency = show and 0 or 1,
+		TextTransparency = show and 0 or 1,
+	}):Play()
+	TweenService:Create(launcherStroke, FADE, { Transparency = show and 0.15 or 1 }):Play()
+	if not show then
+		task.delay(0.24, function()
+			if panelOpen then launcher.Visible = false end
+		end)
+	end
+end
+
+local function openPanel()
+	panelOpen = true
+	panel.Position = panelHome + RISE
+	panel.GroupTransparency = 1
 	panel.Visible = true
-	launcher.Visible = false
-end)
+	TweenService:Create(panel, FADE, { GroupTransparency = 0, Position = panelHome }):Play()
+	showLauncher(false)
+end
+
+local function closePanel()
+	panelOpen = false
+	panelHome = panel.Position
+	local tween = TweenService:Create(panel, FADE, {
+		GroupTransparency = 1,
+		Position = panelHome + RISE,
+	})
+	tween.Completed:Connect(function()
+		if not panelOpen then
+			panel.Visible = false
+			panel.Position = panelHome
+		end
+	end)
+	tween:Play()
+	showLauncher(true)
+end
+
+hideBtn.Activated:Connect(closePanel)
+launcher.Activated:Connect(openPanel)
+
+launcher.BackgroundTransparency = 1
+launcher.TextTransparency = 1
+launcherStroke.Transparency = 1
+openPanel()
 
 --==============================================================
 -- РЕСПАВН

@@ -12,8 +12,34 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService     = game:GetService("TweenService")
 local Workspace        = game:GetService("Workspace")
 
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
 local player  = Players.LocalPlayer
 local camera  = Workspace.CurrentCamera
+
+--==============================================================
+-- ДОСТУП И УДАЛЁННЫЙ КОНФИГ
+--==============================================================
+-- Решение принимает сервер: клиент не может выдать себе доступ,
+-- подменив значение, потому что панель дальше просто не строится.
+local accessRemote = ReplicatedStorage:WaitForChild("EloAccess", 30)
+if not accessRemote then
+	warn("[EloHub] серверная часть не найдена")
+	return
+end
+
+local function requestAccess()
+	local ok, result = pcall(function()
+		return accessRemote:InvokeServer()
+	end)
+	if ok and type(result) == "table" then return result end
+	return nil
+end
+
+local access = requestAccess()
+if not access or not access.allowed then return end
+
+local remoteSettings = access.settings or {}
 
 --==============================================================
 -- ПАЛИТРА
@@ -56,10 +82,31 @@ local state = {
 	arrows     = false,   -- стрелки к целям вне экрана
 	tapTp      = false,   -- телепорт по тапу в точку
 
+	uiScale    = 70,      -- стартовый масштаб панели, %
+
 	tpTarget   = nil,     -- выбранный игрок
 }
 
 local DEFAULT_WALKSPEED = 16
+
+-- значения из конфига перекрывают локальные умолчания
+local function applyRemoteSettings(settings)
+	if type(settings) ~= "table" then return end
+
+	local numbers = {
+		"speedValue", "flySpeed", "wallAlpha",
+		"aimFov", "triggerRadius", "triggerDelay", "uiScale",
+	}
+	for _, key in ipairs(numbers) do
+		if type(settings[key]) == "number" then state[key] = settings[key] end
+	end
+
+	if type(settings.aimPart) == "string" then state.aimPart = settings.aimPart end
+	if type(settings.aimWall) == "boolean" then state.aimWall = settings.aimWall end
+	if type(settings.aimNpc) == "boolean" then state.aimNpc = settings.aimNpc end
+end
+
+applyRemoteSettings(remoteSettings)
 
 --[[ Подключение к боевой системе твоей игры.
      Триггербот и silent aim не могут «стрелять» сами — они лишь сообщают,
@@ -69,6 +116,13 @@ local CONFIG = {
 	triggerRadius = 45,    -- цель должна быть в этом радиусе от центра, px
 	triggerDelay  = 0.12,  -- пауза между авто-срабатываниями, сек
 }
+
+if type(remoteSettings.triggerRadius) == "number" then
+	CONFIG.triggerRadius = remoteSettings.triggerRadius
+end
+if type(remoteSettings.triggerDelay) == "number" then
+	CONFIG.triggerDelay = remoteSettings.triggerDelay
+end
 
 --==============================================================
 -- ХЕЛПЕРЫ
@@ -245,7 +299,7 @@ local panel = new("CanvasGroup", {
 })
 new("UISizeConstraint", { MaxSize = Vector2.new(336, 448), MinSize = Vector2.new(252, 380), Parent = panel })
 
-local uiScale = new("UIScale", { Scale = 0.7, Parent = panel })
+local uiScale = new("UIScale", { Scale = state.uiScale / 100, Parent = panel })
 local panelHome = panel.Position   -- куда панель возвращается после анимации
 
 buildBackdrop(panel)
@@ -307,10 +361,25 @@ local hideBtn = new("TextButton", {
 corner(10, hideBtn)
 stroke(1, PALETTE.white, 0.5, hideBtn)
 
+local tabBar = new("Frame", {
+	Name = "Tabs",
+	Position = UDim2.new(0, 0, 0, 42),
+	Size = UDim2.new(1, 0, 0, 30),
+	BackgroundTransparency = 1,
+	ZIndex = 12,
+	Parent = shell,
+})
+new("UIListLayout", {
+	FillDirection = Enum.FillDirection.Horizontal,
+	Padding = UDim.new(0, 6),
+	Parent = tabBar,
+})
+
 local body = new("ScrollingFrame", {
 	Name = "Body",
-	Position = UDim2.new(0, 0, 0, 44),
-	Size = UDim2.new(1, 0, 1, -44),
+	Position = UDim2.new(0, 0, 0, 80),
+	Size = UDim2.new(1, 0, 1, -80),
+	ScrollingDirection = Enum.ScrollingDirection.Y,
 	BackgroundTransparency = 1,
 	BorderSizePixel = 0,
 	Active = true,
@@ -332,21 +401,66 @@ new("UIPadding", { PaddingRight = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6)
 --==============================================================
 -- КОНСТРУКТОРЫ ЭЛЕМЕНТОВ
 --==============================================================
-local function makeCard(order, height)
+local TABS = { "Обзор", "Движение", "Бой", "UI" }
+local tabCards = {}
+for _, name in ipairs(TABS) do tabCards[name] = {} end
+local currentTab = TABS[1]
+
+-- Active = false у карточек: иначе они перехватывали бы свайп у списка
+local function makeCard(order, height, tab)
 	local card = new("Frame", {
 		Size = UDim2.new(1, 0, 0, height),
 		BackgroundColor3 = PALETTE.white,
 		BackgroundTransparency = 0.9,
 		BorderSizePixel = 0,
-		Active = true,
+		Active = false,
+		Visible = (tab == currentTab),
 		LayoutOrder = order,
 		ZIndex = 12,
 		Parent = body,
 	})
+	table.insert(tabCards[tab], card)
 	corner(12, card)
 	stroke(1, PALETTE.white, 0.6, card)
 	new("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12), Parent = card })
 	return card
+end
+
+local tabButtons = {}
+
+local function selectTab(name)
+	currentTab = name
+	for tab, cards in pairs(tabCards) do
+		for _, card in ipairs(cards) do
+			card.Visible = (tab == name)
+		end
+	end
+	for tab, btn in pairs(tabButtons) do
+		local active = (tab == name)
+		btn.BackgroundTransparency = active and 0.05 or 0.86
+		btn.BackgroundColor3 = active and PALETTE.accent or PALETTE.white
+		btn.TextTransparency = active and 0 or 0.25
+	end
+	body.CanvasPosition = Vector2.zero
+end
+
+for _, name in ipairs(TABS) do
+	local btn = new("TextButton", {
+		Size = UDim2.new(0.25, -5, 1, 0),
+		BackgroundColor3 = PALETTE.white,
+		BackgroundTransparency = 0.86,
+		Text = name,
+		TextColor3 = PALETTE.white,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		AutoButtonColor = false,
+		ZIndex = 12,
+		Parent = tabBar,
+	})
+	corner(9, btn)
+	stroke(1, PALETTE.white, 0.55, btn)
+	tabButtons[name] = btn
+	btn.Activated:Connect(function() selectTab(name) end)
 end
 
 local function makeToggle(card, titleText, subtitleText, onChanged)
@@ -415,8 +529,12 @@ local function makeToggle(card, titleText, subtitleText, onChanged)
 	end)
 end
 
--- общий обработчик перетаскивания ползунков
+-- Перетаскивание ползунков.
+-- Вертикальный свайп по списку не должен двигать ползунок, поэтому дорожка
+-- захватывается только когда палец ушёл вбок дальше, чем вверх-вниз.
 local activeSlider = nil
+local pendingSlider = nil
+local DRAG_THRESHOLD = 8
 
 local function makeSlider(card, yOffset, labelFmt, minVal, maxVal, startVal, onChanged)
 	local label = new("TextLabel", {
@@ -432,13 +550,14 @@ local function makeSlider(card, yOffset, labelFmt, minVal, maxVal, startVal, onC
 		Parent = card,
 	})
 
-	local track = new("Frame", {
+	local track = new("TextButton", {
 		Position = UDim2.new(0, 0, 0, yOffset + 22),
 		Size = UDim2.new(1, 0, 0, 10),
 		BackgroundColor3 = PALETTE.deep,
 		BackgroundTransparency = 0.3,
 		BorderSizePixel = 0,
-		Active = true,
+		Text = "",
+		AutoButtonColor = false,
 		ZIndex = 13,
 		Parent = card,
 	})
@@ -482,8 +601,7 @@ local function makeSlider(card, yOffset, labelFmt, minVal, maxVal, startVal, onC
 	local function grab(input)
 		if input.UserInputType == Enum.UserInputType.Touch
 			or input.UserInputType == Enum.UserInputType.MouseButton1 then
-			activeSlider = fromX
-			fromX(input.Position.X)
+			pendingSlider = { apply = fromX, origin = input.Position }
 		end
 	end
 
@@ -1254,7 +1372,7 @@ end)
 --==============================================================
 
 -- 1. ESP + выбор режима
-local espCard = makeCard(1, 106)
+local espCard = makeCard(1, 106, "Обзор")
 makeToggle(espCard, "ESP", "Игроки и NPC, хп в реальном времени", function(on)
 	state.esp = on
 	clearAllEsp()
@@ -1310,7 +1428,7 @@ end
 selectEspMode("box")
 
 -- 2. Стрелки к целям вне экрана
-local arrowCard = makeCard(2, 58)
+local arrowCard = makeCard(2, 58, "Обзор")
 makeToggle(arrowCard, "Стрелки к целям", "Указатели по краям экрана", function(on)
 	state.arrows = on
 	clearAllEsp()
@@ -1318,31 +1436,31 @@ makeToggle(arrowCard, "Стрелки к целям", "Указатели по �
 end)
 
 -- 3. Wallhack
-local noclipCard = makeCard(3, 58)
+local noclipCard = makeCard(3, 58, "Движение")
 makeToggle(noclipCard, "Wallhack", "Проход сквозь стены и объекты", function(on)
 	state.noclip = on
 	if not on then restoreCollision() end
 end)
 
 -- 4. Прозрачные стены
-local wallCard = makeCard(4, 110)
+local wallCard = makeCard(4, 110, "Обзор")
 makeToggle(wallCard, "Прозрачные стены", "Геометрия просвечивает", function(on)
 	state.wall = on
 	if on then enableWall() else disableWall() end
 end)
-makeSlider(wallCard, 58, "Прозрачность: %d%%", 30, 95, 75, function(value)
+makeSlider(wallCard, 58, "Прозрачность: %d%%", 30, 95, state.wallAlpha * 100, function(value)
 	state.wallAlpha = value / 100
 	if state.wall then refreshWallAlpha() end
 end)
 
 -- 5. Скорость + ползунок
-local speedCard = makeCard(5, 110)
+local speedCard = makeCard(5, 110, "Движение")
 makeToggle(speedCard, "Скорость", "Ускоренное передвижение", function(on)
 	state.speed = on
 	local hum = getHumanoid()
 	if hum then hum.WalkSpeed = on and state.speedValue or DEFAULT_WALKSPEED end
 end)
-makeSlider(speedCard, 58, "Значение: %d", 16, 150, 32, function(value)
+makeSlider(speedCard, 58, "Значение: %d", 16, 150, state.speedValue, function(value)
 	state.speedValue = value
 	if state.speed then
 		local hum = getHumanoid()
@@ -1351,7 +1469,7 @@ makeSlider(speedCard, 58, "Значение: %d", 16, 150, 32, function(value)
 end)
 
 -- 6. Полёт
-local flyCard = makeCard(6, 58)
+local flyCard = makeCard(6, 58, "Движение")
 makeToggle(flyCard, "Полёт", "Джойстик — курс, ↑↓ — высота", function(on)
 	state.fly = on
 	if on then
@@ -1365,7 +1483,7 @@ makeToggle(flyCard, "Полёт", "Джойстик — курс, ↑↓ — в�
 end)
 
 -- 7. Наведение + поле захвата
-local aimCard = makeCard(7, 110)
+local aimCard = makeCard(7, 110, "Бой")
 makeToggle(aimCard, "Наведение", "Жёсткая фиксация на цели", function(on)
 	state.aim = on
 	aimCircle.Visible = on
@@ -1377,21 +1495,21 @@ makeSlider(aimCard, 58, "Поле захвата: %d px", 40, 500, state.aimFov,
 end)
 
 -- 8. Silent aim
-local silentCard = makeCard(8, 58)
+local silentCard = makeCard(8, 58, "Бой")
 makeToggle(silentCard, "Silent aim", "Стрельба в цель без поворота камеры", function(on)
 	state.silent = on
 	if not on then aimTarget = nil end
 end)
 
 -- 9. Триггербот
-local triggerCard = makeCard(9, 58)
+local triggerCard = makeCard(9, 58, "Бой")
 makeToggle(triggerCard, "Триггербот", "Авто-срабатывание при захвате цели", function(on)
 	state.trigger = on
 	if not on then aimTarget = nil end
 end)
 
 -- 10. Телепорт к игроку
-local tpCard = makeCard(10, 126)
+local tpCard = makeCard(10, 126, "Движение")
 new("TextLabel", {
 	Position = UDim2.new(0, 0, 0, 10),
 	Size = UDim2.new(1, 0, 0, 20),
@@ -1566,13 +1684,13 @@ tpButton.Activated:Connect(function()
 end)
 
 -- 11. Телепорт по тапу
-local tapCard = makeCard(11, 58)
+local tapCard = makeCard(11, 58, "Движение")
 makeToggle(tapCard, "Телепорт по тапу", "Тап по миру — прыжок в точку", function(on)
 	state.tapTp = on
 end)
 
 -- 12. Размер интерфейса
-local sizeCard = makeCard(12, 92)
+local sizeCard = makeCard(12, 92, "UI")
 new("TextLabel", {
 	Position = UDim2.new(0, 0, 0, 10),
 	Size = UDim2.new(1, 0, 0, 20),
@@ -1585,8 +1703,55 @@ new("TextLabel", {
 	ZIndex = 13,
 	Parent = sizeCard,
 })
-makeSlider(sizeCard, 36, "Масштаб: %d%%", 70, 160, 70, function(value)
+makeSlider(sizeCard, 36, "Масштаб: %d%%", 70, 160, state.uiScale, function(value)
+	state.uiScale = value
 	uiScale.Scale = value / 100
+end)
+
+--==============================================================
+-- ВИДИМОСТЬ СТРОК ПО КОНФИГУ + ОТЗЫВ ДОСТУПА
+--==============================================================
+local cards = {
+	esp        = espCard,
+	arrows     = arrowCard,
+	noclip     = noclipCard,
+	wall       = wallCard,
+	speed      = speedCard,
+	fly        = flyCard,
+	aim        = aimCard,
+	silent     = silentCard,
+	trigger    = triggerCard,
+	tp         = tpCard,
+	tapTp      = tapCard,
+	uiScaleRow = sizeCard,
+}
+
+local function applyFeatureFlags(settings)
+	local flags = settings and settings.features
+	if type(flags) ~= "table" then return end
+	for key, card in pairs(cards) do
+		-- UIListLayout сам пропускает скрытые элементы, дырки не остаётся
+		card.Visible = flags[key] ~= false
+	end
+end
+
+applyFeatureFlags(remoteSettings)
+
+-- конфиг перечитывается на ходу: правишь JSON — панель подхватывает,
+-- перезаходить в игру не нужно
+task.spawn(function()
+	while true do
+		task.wait(60)
+		local fresh = requestAccess()
+		if fresh then
+			if not fresh.allowed then
+				gui:Destroy()
+				break
+			end
+			applyRemoteSettings(fresh.settings)
+			applyFeatureFlags(fresh.settings)
+		end
+	end
 end)
 
 --==============================================================
@@ -1611,6 +1776,14 @@ UserInputService.InputChanged:Connect(function(input)
 
 	if activeSlider then
 		activeSlider(input.Position.X)
+	elseif pendingSlider then
+		local delta = input.Position - pendingSlider.origin
+		if math.abs(delta.X) > DRAG_THRESHOLD and math.abs(delta.X) > math.abs(delta.Y) then
+			activeSlider = pendingSlider.apply
+			activeSlider(input.Position.X)
+		elseif math.abs(delta.Y) > DRAG_THRESHOLD then
+			pendingSlider = nil   -- это листание, отдаём жест списку
+		end
 	elseif dragging then
 		local delta = input.Position - dragStart
 		panel.Position = UDim2.new(
@@ -1624,8 +1797,18 @@ UserInputService.InputEnded:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.Touch
 		or input.UserInputType == Enum.UserInputType.MouseButton1 then
 		if dragging then panelHome = panel.Position end
+
+		-- короткий тап по дорожке ставит значение в этой точке
+		if pendingSlider and not activeSlider then
+			local delta = input.Position - pendingSlider.origin
+			if delta.Magnitude <= DRAG_THRESHOLD then
+				pendingSlider.apply(input.Position.X)
+			end
+		end
+
 		dragging = false
 		activeSlider = nil
+		pendingSlider = nil
 	end
 end)
 
@@ -1681,6 +1864,8 @@ end
 
 hideBtn.Activated:Connect(closePanel)
 launcher.Activated:Connect(openPanel)
+
+selectTab(TABS[1])
 
 launcher.BackgroundTransparency = 1
 launcher.TextTransparency = 1

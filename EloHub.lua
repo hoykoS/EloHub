@@ -10,6 +10,20 @@ local TweenService = game:GetService("TweenService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
+-- Prefer CoreGui: some games actively scan/clear PlayerGui and would tear
+-- this window down (or block it from ever rendering) before it's usable.
+-- Most executors grant write access to CoreGui even though a normal
+-- LocalScript can't; fall back to PlayerGui if that access isn't there.
+local function resolveGuiParent()
+	local ok, coreGui = pcall(function()
+		return game:GetService("CoreGui")
+	end)
+	if ok and coreGui then
+		return coreGui
+	end
+	return playerGui
+end
+
 -- --------------------------------------------------------------------------
 -- Storage (best-effort: not every executor exposes file IO)
 -- --------------------------------------------------------------------------
@@ -84,14 +98,17 @@ local ERROR_TEXT = {
 }
 
 -- --------------------------------------------------------------------------
--- UI
+-- UI — wrapped in pcall so a single unsupported property/API on some
+-- executor prints a warning (F9 console) instead of the window silently
+-- never appearing with no trace of why.
 -- --------------------------------------------------------------------------
+local function buildUI()
 local gui = Instance.new("ScreenGui")
 gui.Name = "EloHubKeyGate"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.DisplayOrder = 999
-gui.Parent = playerGui
+gui.Parent = resolveGuiParent()
 
 local overlay = Instance.new("Frame")
 overlay.Size = UDim2.fromScale(1, 1)
@@ -253,4 +270,10 @@ local saved = loadSavedKey()
 if saved then
 	input.Text = saved
 	attempt(saved)
+end
+end
+
+local uiOk, uiErr = pcall(buildUI)
+if not uiOk then
+	warn("[EloHubKeyGate] Не удалось построить окно ключа: " .. tostring(uiErr))
 end

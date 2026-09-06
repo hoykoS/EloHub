@@ -1,11 +1,16 @@
 local SCRIPT_SLUG = "elohub"
 local SCRIPT_TITLE = "EloHub"
-local VALIDATE_URL = "https://elohub-tg.onrender.com/validate"
 local KEY_FILE = "elohub_" .. SCRIPT_SLUG .. "_key.txt"
+
+-- Same repo/branch this loader itself was fetched from — reachable by every
+-- executor (including mobile ones like Delta with no working POST/custom
+-- HTTP client) because it's the exact same game:HttpGet call and domain
+-- already used to load this file.
+local MANIFEST_URL = "https://raw.githubusercontent.com/hoykoS/EloHub/main/data/manifest.json"
+local PAYLOAD_URL = "https://raw.githubusercontent.com/hoykoS/EloHub/main/data/payload.enc"
 
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
-local TweenService = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -57,52 +62,164 @@ local function clearSavedKey()
 end
 
 -- --------------------------------------------------------------------------
--- Backend call
+-- Crypto — pure arithmetic (mod/div only, never bit32/bit ops, which behave
+-- inconsistently across Luau versions). Mirrored byte-for-byte in the bot's
+-- bot/services/roblox_crypto.py; do not change one without the other.
 -- --------------------------------------------------------------------------
--- Plain GET via game:HttpGet — the one HTTP call every executor supports,
--- including mobile ones (Delta, etc.) that have no working POST or custom
--- request client at all, since it's the exact same call used to fetch this
--- loader in the first place. Parameters travel in the query string and the
--- backend accepts them there (POST is also still accepted for executors
--- that do support it, but GET is the reliable baseline).
-local function requestValidate(key)
-	local url = string.format(
-		"%s?key=%s&robloxUserId=%d&script=%s",
-		VALIDATE_URL,
-		HttpService:UrlEncode(key),
-		player.UserId,
-		HttpService:UrlEncode(SCRIPT_SLUG)
-	)
+local CRYPTO_M = 16777216
+local CRYPTO_LCG_A = 1103
+local CRYPTO_LCG_C = 12345
+local CRYPTO_HASH_MULT = 131
 
-	local ok, response = pcall(function()
+local function seedFromBytes(bytes)
+	local seed = 0
+	for i = 1, #bytes do
+		seed = (seed * CRYPTO_HASH_MULT + bytes[i]) % CRYPTO_M
+	end
+	return seed
+end
+
+local function seedFromText(text)
+	local seed = 0
+	for i = 1, #text do
+		seed = (seed * CRYPTO_HASH_MULT + string.byte(text, i)) % CRYPTO_M
+	end
+	return seed
+end
+
+local function keystream(seed, length)
+	local state = seed
+	local out = table.create and table.create(length) or {}
+	for i = 1, length do
+		state = (state * CRYPTO_LCG_A + CRYPTO_LCG_C) % CRYPTO_M
+		out[i] = state % 256
+	end
+	return out
+end
+
+local function byteXor(a, b)
+	local result = 0
+	local bitval = 1
+	while a > 0 or b > 0 do
+		local abit = a % 2
+		local bbit = b % 2
+		if abit ~= bbit then
+			result = result + bitval
+		end
+		a = (a - abit) / 2
+		b = (b - bbit) / 2
+		bitval = bitval * 2
+	end
+	return result
+end
+
+local function xorBytes(bytes, ks)
+	local out = {}
+	for i = 1, #bytes do
+		out[i] = byteXor(bytes[i], ks[i])
+	end
+	return out
+end
+
+local function stringToBytes(s)
+	local bytes = {}
+	for i = 1, #s do
+		bytes[i] = string.byte(s, i)
+	end
+	return bytes
+end
+
+local function bytesToString(bytes)
+	local chars = {}
+	for i = 1, #bytes do
+		chars[i] = string.char(bytes[i])
+	end
+	return table.concat(chars)
+end
+
+local function hexToBytes(hex)
+	local bytes = {}
+	for i = 1, #hex, 2 do
+		bytes[#bytes + 1] = tonumber(hex:sub(i, i + 1), 16)
+	end
+	return bytes
+end
+
+local function lookupHash(key)
+	return string.format("%06x", seedFromText(key))
+end
+
+local function watermarkTag(key)
+	return string.format("%06x", seedFromText(key .. ":wm"))
+end
+
+local function unwrapSecret(wrappedHex, key)
+	local wrappedBytes = hexToBytes(wrappedHex)
+	local ks = keystream(seedFromText(key), #wrappedBytes)
+	return xorBytes(wrappedBytes, ks)
+end
+
+local function decryptPayload(payloadHex, secretBytes)
+	local cipherBytes = hexToBytes(payloadHex)
+	local ks = keystream(seedFromBytes(secretBytes), #cipherBytes)
+	return bytesToString(xorBytes(cipherBytes, ks))
+end
+
+-- --------------------------------------------------------------------------
+-- Local activation check — no live backend call at all: the manifest and
+-- encrypted payload are static files fetched with the same game:HttpGet
+-- that already loaded this script. A key that isn't in the manifest (never
+-- issued, or blocked and removed on the next export) simply can't unwrap
+-- anything meaningful.
+-- --------------------------------------------------------------------------
+local function fetchText(url)
+	local ok, body = pcall(function()
 		return game:HttpGet(url)
 	end)
-	if not ok then
+	if not ok or not body or #body == 0 then
+		return nil
+	end
+	return body
+end
+
+local function activate(key)
+	local manifestText = fetchText(MANIFEST_URL)
+	if not manifestText then
+		return false, "network_error"
+	end
+	local decodeOk, manifest = pcall(function()
+		return HttpService:JSONDecode(manifestText)
+	end)
+	if not decodeOk or type(manifest) ~= "table" then
 		return false, "network_error"
 	end
 
-	local decodeOk, decoded = pcall(function()
-		return HttpService:JSONDecode(response)
+	local wrapped = manifest[lookupHash(key)]
+	if not wrapped then
+		return false, "not_found"
+	end
+
+	local payloadHex = fetchText(PAYLOAD_URL)
+	if not payloadHex then
+		return false, "network_error"
+	end
+
+	local ok, source = pcall(function()
+		local secretBytes = unwrapSecret(wrapped, key)
+		return decryptPayload(payloadHex, secretBytes)
 	end)
-	if not decodeOk or type(decoded) ~= "table" then
+	if not ok or not source or #source == 0 then
 		return false, "bad_response"
 	end
 
-	if decoded.ok == true then
-		return true, decoded.source
-	end
-	return false, decoded.reason or "unknown_error"
+	local watermark = string.format('local _EH_TAG = "%s"\n', watermarkTag(key))
+	return true, watermark .. source
 end
 
 local ERROR_TEXT = {
 	not_found = "Ключ не найден. Проверьте и попробуйте снова.",
-	wrong_script = "Этот ключ не подходит для данного скрипта.",
-	revoked = "Этот ключ заблокирован администратором.",
-	already_bound = "Ключ уже привязан к другому аккаунту Roblox.",
-	bad_request = "Некорректный запрос. Попробуйте снова.",
-	script_unavailable = "Скрипт временно недоступен на сервере.",
 	network_error = "Нет соединения с сервером. Проверьте интернет и попробуйте снова.",
-	bad_response = "Сервер вернул некорректный ответ. Попробуйте снова.",
+	bad_response = "Не удалось прочитать данные. Попробуйте снова.",
 }
 
 -- --------------------------------------------------------------------------
@@ -183,9 +300,9 @@ input.BackgroundTransparency = 1
 input.Position = UDim2.new(0, 12, 0, 0)
 input.Size = UDim2.new(1, -24, 1, 0)
 input.Font = Enum.Font.GothamMedium
-input.TextSize = 15
+input.TextSize = 14
 input.TextColor3 = Color3.fromRGB(235, 235, 240)
-input.PlaceholderText = "EH-XXX-XXX"
+input.PlaceholderText = "EH-XXXXXXXXXXXXXXXX"
 input.PlaceholderColor3 = Color3.fromRGB(110, 110, 120)
 input.Text = ""
 input.ClearTextOnFocus = false
@@ -241,12 +358,10 @@ end
 
 local attempting = false
 
--- The backend (Render) can take up to ~30-60s to wake up from a cold start
--- or finish restarting after a deploy — a single game:HttpGet often times
--- out before that finishes. Retry a few times with a short pause instead
--- of failing on the very first attempt.
+-- GitHub's raw CDN occasionally hiccups; retry a couple of times before
+-- showing an error instead of failing on the very first blip.
 local RETRY_ATTEMPTS = 3
-local RETRY_DELAY_SECONDS = 4
+local RETRY_DELAY_SECONDS = 3
 
 local function attempt(key)
 	if attempting or #key == 0 then
@@ -258,7 +373,7 @@ local function attempt(key)
 	local ok, result
 	for i = 1, RETRY_ATTEMPTS do
 		setBusy(true, i > 1 and string.format("Проверка... (%d/%d)", i, RETRY_ATTEMPTS) or nil)
-		ok, result = requestValidate(key)
+		ok, result = activate(key)
 		if ok or result ~= "network_error" then
 			break
 		end

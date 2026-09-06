@@ -59,59 +59,24 @@ end
 -- --------------------------------------------------------------------------
 -- Backend call
 -- --------------------------------------------------------------------------
--- Roblox's own HttpService:PostAsync only reaches domains on Roblox's
--- allowlist and most executors don't bother patching it (unlike
--- game:HttpGet, which is patched almost everywhere) — so a POST to our own
--- server via PostAsync fails even when the server is perfectly healthy.
--- Every serious executor instead exposes a raw HTTP client under one of
--- these names (the "UNC" request function) that talks to any domain;
--- PostAsync is only the last-resort fallback for Studio/rare executors
--- that do patch it.
-local function nativeRequest()
-	return (syn and syn.request) or http_request or request or (fluxus and fluxus.request)
-end
-
-local function httpPostJson(url, jsonBody)
-	local requestFn = nativeRequest()
-	if requestFn then
-		local ok, res = pcall(function()
-			return requestFn({
-				Url = url,
-				Method = "POST",
-				Headers = { ["Content-Type"] = "application/json" },
-				Body = jsonBody,
-			})
-		end)
-		if ok and type(res) == "table" then
-			local status = res.StatusCode
-			local success = res.Success == true or (status and status >= 200 and status < 300)
-			if success and res.Body then
-				return true, res.Body
-			end
-			return false, nil
-		end
-		return false, nil
-	end
-
-	-- Fallback: the real HttpService (works in Studio, or on the rare
-	-- executor that does patch PostAsync).
-	local ok, response = pcall(function()
-		return HttpService:PostAsync(url, jsonBody, Enum.HttpContentType.ApplicationJson)
-	end)
-	if ok then
-		return true, response
-	end
-	return false, nil
-end
-
+-- Plain GET via game:HttpGet — the one HTTP call every executor supports,
+-- including mobile ones (Delta, etc.) that have no working POST or custom
+-- request client at all, since it's the exact same call used to fetch this
+-- loader in the first place. Parameters travel in the query string and the
+-- backend accepts them there (POST is also still accepted for executors
+-- that do support it, but GET is the reliable baseline).
 local function requestValidate(key)
-	local payload = HttpService:JSONEncode({
-		key = key,
-		robloxUserId = player.UserId,
-		script = SCRIPT_SLUG,
-	})
+	local url = string.format(
+		"%s?key=%s&robloxUserId=%d&script=%s",
+		VALIDATE_URL,
+		HttpService:UrlEncode(key),
+		player.UserId,
+		HttpService:UrlEncode(SCRIPT_SLUG)
+	)
 
-	local ok, response = httpPostJson(VALIDATE_URL, payload)
+	local ok, response = pcall(function()
+		return game:HttpGet(url)
+	end)
 	if not ok then
 		return false, "network_error"
 	end

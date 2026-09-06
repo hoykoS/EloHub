@@ -220,10 +220,10 @@ local buttonCorner = Instance.new("UICorner")
 buttonCorner.CornerRadius = UDim.new(0, 10)
 buttonCorner.Parent = button
 
-local function setBusy(busy)
+local function setBusy(busy, progressText)
 	button.Active = not busy
 	input.TextEditable = not busy
-	button.Text = busy and "Проверка..." or "Активировать"
+	button.Text = busy and (progressText or "Проверка...") or "Активировать"
 end
 
 local function runSource(source)
@@ -241,15 +241,32 @@ end
 
 local attempting = false
 
+-- The backend (Render) can take up to ~30-60s to wake up from a cold start
+-- or finish restarting after a deploy — a single game:HttpGet often times
+-- out before that finishes. Retry a few times with a short pause instead
+-- of failing on the very first attempt.
+local RETRY_ATTEMPTS = 3
+local RETRY_DELAY_SECONDS = 4
+
 local function attempt(key)
 	if attempting or #key == 0 then
 		return
 	end
 	attempting = true
-	setBusy(true)
 	status.Text = ""
 
-	local ok, result = requestValidate(key)
+	local ok, result
+	for i = 1, RETRY_ATTEMPTS do
+		setBusy(true, i > 1 and string.format("Проверка... (%d/%d)", i, RETRY_ATTEMPTS) or nil)
+		ok, result = requestValidate(key)
+		if ok or result ~= "network_error" then
+			break
+		end
+		if i < RETRY_ATTEMPTS then
+			task.wait(RETRY_DELAY_SECONDS)
+		end
+	end
+
 	attempting = false
 	setBusy(false)
 
